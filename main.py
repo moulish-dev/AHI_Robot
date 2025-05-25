@@ -26,8 +26,20 @@ from kokoro import KPipeline
 import soundfile as sf
 import torch
 import os
+import warnings
+import time
+import numpy as np
+import uuid
+import queue
+
+audio_queue = queue.Queue()
+
+# to supress pytorch warnings
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 model_name = "gemma3:1b"
+debug = False
 
 # Initialize conversation
 messages = [
@@ -36,38 +48,123 @@ messages = [
 ]
 
 # First response from the bot
-response = ollama.chat(model=model_name, messages=messages)
-print("Bot:", response.message.content)
+response = ollama.chat(
+    model=model_name, 
+    messages=messages,
+    stream=True,
+    )
+for chunk in response:
+  print(chunk['message']['content'], end='', flush=True)
 
-# def ask_ollama(prompt):
-#     # response = requests.post(
-#     #     "http://localhost:11434/api/generate",
-#     #     json={"model": "gemma3:1b", "prompt": prompt},
-#     #     stream=False
-#     # )
-#     # print("Full Ollama Response JSON:", response.json())  # Debug
-#     # return response.json()["response"]
-#     response = ollama.generate(model="gemma3:1b",prompt=prompt)
-#     return response.get("response", "No response")
+
 
 def speak(text):
-    pipeline = KPipeline(lang_code='a',repo_id='hexgrad/Kokoro-82M')
+    
+    start = time.time()
     generator = pipeline(text, voice='af_heart')
-    for i, (gs, ps, audio) in enumerate(generator):
-        # print(f"Segment {i}: {gs} | {ps}")
-        file_path = f'{i}.wav'
-        sf.write(file_path, audio, 24000)
-        os.system(f"aplay {file_path}")
+    all_audio = []
+
+    for _, _, audio in generator:
+        all_audio.append(audio)
+
+    # Concatenate all chunks
+    combined_audio = np.concatenate(all_audio)
+    sf.write('response.wav', combined_audio, 24000)
+
+    duration = time.time() - start
+    print(f"🕒 Kokoro processing time: {duration:.2f} seconds")
+
+    # Play once
+    os.system('aplay response.wav')
+
+    os.remove("response.wav")
+
+import re
+
+def remove_emojis(text):
+    emoji_pattern = re.compile(
+        "["
+        "\U0001F600-\U0001F64F"  # emoticons
+        "\U0001F300-\U0001F5FF"  # symbols & pictographs
+        "\U0001F680-\U0001F6FF"  # transport & map symbols
+        "\U0001F1E0-\U0001F1FF"  # flags
+        "\U00002702-\U000027B0"
+        "\U000024C2-\U0001F251"
+        "]+",
+        flags=re.UNICODE,
+    )
+    return emoji_pattern.sub(r'', text)
+
+def split_into_chunks(text):
+    return re.split(r'(?<=[.!?])\s+(?=[A-Z])', text)
+
+def audio_worker():
+    while True:
+        filename = audio_queue.get()
+        if filename is None:
+            break  # Allows clean shutdown if needed
+
+        os.system(f"aplay {filename} > /dev/null 2>&1")
+        try:
+            os.remove(filename)
+        except FileNotFoundError:
+            pass
+        audio_queue.task_done()
+
+import threading
+pipeline = KPipeline(lang_code='a', repo_id='hexgrad/Kokoro-82M')
+
+def threaded_speak(text):
+    def _speak():
+        cleaned = remove_emojis(text.strip())
+        chunks = split_into_chunks(cleaned)
+        for chunk in chunks:
+            
+            generator = pipeline(chunk, voice='af_heart')
+            all_audio = []
+            for _, _, audio in generator:
+                all_audio.append(audio)
+            combined_audio = np.concatenate(all_audio)
+            
+
+            file_id = str(uuid.uuid4())[:8]  # unique short ID
+            filename = f"response_{file_id}.wav"
+
+            sf.write(filename, combined_audio, 24000)
+            # Enqueue the audio file for playback
+            audio_queue.put(filename)
+
+            
+    thread = threading.Thread(target=_speak)
+    thread.start()
+
+# Start background thread to process audio queue
+playback_thread = threading.Thread(target=audio_worker, daemon=True)
+playback_thread.start()
 
 # Continue the conversation
 while True:
     # 🚀 Main loop
-    user_prompt = input("You: ")
-    if not user_input:
+    user_prompt = input("\nYou: ")
+    if not user_prompt:
         break  # exit loop on empty input
-    messages.append({"role": "user", "content": user_input})
-    response = ollama.chat(model=model_name, messages=messages)
-    answer = response.message.content
-    print("Ollama:", answer)
-    speak(answer)
-    messages.append({"role": "assistant", "content": answer})
+    messages.append({"role": "user", "content": user_prompt})
+    response = ollama.chat(model=model_name, messages=messages, stream=True)
+    full_reply = ""
+    buffer = ""
+    for chunk in response:
+        piece = chunk['message']['content'] # as this is being used more time it is a variable
+        print(piece, end='', flush=True)
+        full_reply += piece # for the whole conversation to be saved
+        buffer += piece     # for the audio streaming
+
+        if any(p in buffer for p in [".", "!", "?"]) and len(buffer.strip()) > 15:
+            threaded_speak(buffer.strip())
+            buffer = ""
+    # speak(answer)
+    messages.append({"role": "assistant", "content": full_reply})
+
+
+
+audio_queue.put(None)
+playback_thread.join()
