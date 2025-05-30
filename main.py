@@ -31,6 +31,17 @@ import time
 import numpy as np
 import uuid
 import queue
+from RealtimeSTT import AudioToTextRecorder
+
+recorder = None  # Global so main.py can access
+
+def get_voice_input():
+    print("🎤 Speak now...")
+    with AudioToTextRecorder() as recorder:
+        text = recorder.text()
+        print(f"📝 You said: {text}")
+        return text
+
 
 audio_queue = queue.Queue()
 
@@ -57,6 +68,14 @@ for chunk in response:
   print(chunk['message']['content'], end='', flush=True)
 
 
+from datetime import datetime
+
+LOG_FILE = "conversation_log.txt"
+
+def log_entry(role, text):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(LOG_FILE, "a") as f:
+        f.write(f"[{timestamp}] {role.upper()}:\n{text.strip()}\n\n")
 
 def speak(text):
     
@@ -131,8 +150,11 @@ def threaded_speak(text):
             filename = f"response_{file_id}.wav"
 
             sf.write(filename, combined_audio, 24000)
+            
             # Enqueue the audio file for playback
             audio_queue.put(filename)
+
+            
 
             
     thread = threading.Thread(target=_speak)
@@ -145,10 +167,19 @@ playback_thread.start()
 # Continue the conversation
 while True:
     # 🚀 Main loop
-    user_prompt = input("\nYou: ")
+    print("\n🎤 Speak now (or type if silent)...")
+    user_prompt = get_voice_input()
+
+    # If voice input is empty, fall back to typing
     if not user_prompt:
-        break  # exit loop on empty input
+        user_prompt = input("⌨️  You (typed): ").strip()
+
+    # If both are empty, exit
+    if not user_prompt:
+        print("👋 No input given. Exiting.")
+        break # exit loop on empty input
     messages.append({"role": "user", "content": user_prompt})
+    log_entry("User", user_prompt)
     response = ollama.chat(model=model_name, messages=messages, stream=True)
     full_reply = ""
     buffer = ""
@@ -162,6 +193,7 @@ while True:
             threaded_speak(buffer.strip())
             buffer = ""
     # speak(answer)
+    log_entry("Assistant: ", full_reply)
     messages.append({"role": "assistant", "content": full_reply})
 
 
